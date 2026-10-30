@@ -1,0 +1,99 @@
+# The whole system: Postgres, the API and the web app. pipeline-run.sh starts this stack and the
+# Cloudflare tunnel container; the tunnel routes to http://rixus-frontend:80 on tunnel-net.
+# Secrets come from the git-ignored .env, see .env.example.
+#
+# Network layout: only `web` joins tunnel-net, and only the API can reach Postgres, so a compromise
+# of the public container does not open a route to the database. Nothing is published beyond the
+# web app on the host's loopback (a bare "8096:80" would bypass ufw, since Docker's iptables rules
+# skip it).
+name: business_management
+
+services:
+  db:
+    image: postgres:16.6-alpine
+    container_name: bizsuite-postgres
+    environment:
+      POSTGRES_USER: ${DB_USER:-suite}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env}
+      POSTGRES_DB: ${DB_NAME:-suite}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 1g
+    pids_limit: 256
+    networks:
+      - db-net
+
+  api:
+    build: ./backend
+    container_name: bizsuite-api
+    environment:
+      # The password travels separately so that any character in it is safe.
+      DATABASE_URL: host=db port=5432 dbname=${DB_NAME:-suite} user=${DB_USER:-suite}
+      PGPASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@example.com}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD in .env}
+      COMPANY_NAME: ${COMPANY_NAME:-My Company}
+      COOKIE_SECURE: ${COOKIE_SECURE:-true}
+      SEED_DEMO_DATA: ${SEED_DEMO_DATA:-true}
+      PUBLIC_URL: ${PUBLIC_URL:-}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+    volumes:
+      - attachments:/data/attachments
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 768m
+    pids_limit: 256
+    networks:
+      - db-net
+      - app-net
+
+  web:
+    build: ./frontend
+    # The fixed name the tunnel routes to, shared by every project in this workspace.
+    container_name: rixus-frontend
+    ports:
+      - "127.0.0.1:${WEB_PORT:-8096}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 128m
+    pids_limit: 100
+    networks:
+      - app-net
+      - tunnel-net
+
+volumes:
+  pgdata:
+  attachments:
+
+networks:
+  # No route out: Postgres and the API's database connection only.
+  db-net:
+    internal: true
+  # Not internal: the API sends email through it when SMTP is configured.
+  app-net:
+  tunnel-net:
+    external: true
